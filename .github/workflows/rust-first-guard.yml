@@ -1,0 +1,76 @@
+name: Rust-first Guard
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  rust-first-guard:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Evaluate Rust-first compliance
+        env:
+          OMNIXIUS_POLICY_TOKEN: ${{ secrets.OMNIXIUS_POLICY_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          REPO_NAME="${GITHUB_REPOSITORY#*/}"
+          OWNER="${GITHUB_REPOSITORY_OWNER}"
+
+          if git ls-files | grep -Eq "(^|/)Cargo.toml$"; then
+            echo "Rust manifest detected. Guard passed."
+            exit 0
+          fi
+
+          TOKEN="${OMNIXIUS_POLICY_TOKEN:-${GITHUB_TOKEN:-}}"
+          if [ -z "$TOKEN" ]; then
+            echo "No token available to read central override registry."
+            echo "Set OMNIXIUS_POLICY_TOKEN secret with repo+project read scope."
+            exit 1
+          fi
+
+          REGISTRY_URL="https://api.github.com/repos/${OWNER}/ECOSYSTEM/contents/overrides/temp-language-overrides.yaml"
+          if ! curl -fsSL \
+            -H "Authorization: Bearer ${TOKEN}" \
+            -H "Accept: application/vnd.github.raw" \
+            "$REGISTRY_URL" \
+            -o overrides.yaml; then
+            echo "Failed to fetch override registry from ECOSYSTEM."
+            echo "Ensure OMNIXIUS_POLICY_TOKEN can read ${OWNER}/ECOSYSTEM."
+            exit 1
+          fi
+
+          python - <<'PY'
+          import os
+          import re
+          import sys
+
+          repo = os.environ["GITHUB_REPOSITORY"].split("/", 1)[1]
+          text = open("overrides.yaml", "r", encoding="utf-8").read()
+          blocks = re.split(r"\n(?=\s*-\s+service:)", text)
+          ok = False
+
+          for block in blocks:
+              service = re.search(r"service:\s*\"?([^\n\"]+)\"?", block)
+              if not service or service.group(1).strip() != repo:
+                  continue
+              status = re.search(r"status:\s*\"?([^\n\"]+)\"?", block)
+              if status and status.group(1).strip().lower() == "active":
+                  ok = True
+                  break
+
+          if ok:
+              print(f"Active temporary override found for {repo}. Guard passed.")
+              sys.exit(0)
+
+          print(f"Rust-first violation: repository '{repo}' has no Cargo.toml and no active override in ECOSYSTEM registry.")
+          sys.exit(1)
+          PY
